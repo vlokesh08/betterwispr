@@ -32,7 +32,9 @@ struct SettingsView: View {
                 }
 
                 SettingsSection("Shortcut") {
-                    ShortcutRecorder(model: model)
+                    ShortcutRecorder(model: model, kind: .dictation)
+                    RowDivider()
+                    ShortcutRecorder(model: model, kind: .cancel)
                     RowDivider()
                     SettingRow("Behavior", caption: model.settings.dictationMode == .hold
                         ? "Hold to speak and release to finish. A quick tap starts hands-free dictation."
@@ -69,6 +71,20 @@ struct SettingsView: View {
                         Button("Open Vocabulary") { model.selectedPage = .vocabulary }
                     }
                     RowDivider()
+                    SettingRow("Unload speech model when idle", caption: "Frees memory between dictations. The next dictation loads the model again, so it can take a moment longer to finish.") {
+                        Picker("Unload speech model when idle", selection: Binding(
+                            get: { model.settings.unloadModelWhenIdle },
+                            set: { model.settings.unloadModelWhenIdle = $0; model.saveSettings(); model.scheduleIdleUnload() }
+                        )) {
+                            Text("Never").tag(ModelIdleUnload.never)
+                            Text("After 5 minutes").tag(ModelIdleUnload.fiveMinutes)
+                            Text("After 15 minutes").tag(ModelIdleUnload.fifteenMinutes)
+                            Text("After 1 hour").tag(ModelIdleUnload.oneHour)
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                    RowDivider()
                     SettingRow("Input sensitivity", caption: "Lower filters help quiet voices but let more background noise through.") {
                         Picker("Input sensitivity", selection: setting(\.silenceThreshold)) {
                             Text("Standard").tag(Float(0.002))
@@ -93,7 +109,9 @@ struct SettingsView: View {
                 SettingsSection("App") {
                     SettingToggle("Show in Dock", caption: "When off, use the menu bar to open BetterWispr. Your dictation shortcut still works.", isOn: setting(\.showInDock))
                     RowDivider()
-                    SettingToggle("Dictation sounds", caption: "Soft cues when you finish, cancel or need attention. Quiet during meeting capture.", isOn: setting(\.soundEffects))
+                    SettingToggle("Dictation sounds", caption: "Soft cues when dictation starts listening, finishes, cancels or needs attention. Quiet during meeting capture.", isOn: setting(\.soundEffects))
+                    RowDivider()
+                    SettingToggle("Pause music while dictating", caption: "Pauses Music and Spotify while you speak, then resumes them. Browsers and other players keep playing. macOS asks for permission for each of these apps that is open when you turn this on.", isOn: pauseMediaWhileDictating)
                     RowDivider()
                     SettingToggle("Floating recording capsule", caption: "A small voice control at the bottom of your screen.", isOn: setting(\.showCapsule))
                     RowDivider()
@@ -106,10 +124,38 @@ struct SettingsView: View {
                     SettingToggle("Save dictation history", caption: "Keep text on this Mac so you can find and reuse it.", isOn: setting(\.saveHistory))
                 }
 
+                SettingsSection("Calendar") {
+                    SettingToggle("Use Calendar", caption: model.settings.useCalendar && !model.calendarGranted
+                                      ? "Waiting for Calendar access. Choose Allow… for Calendar under Permissions."
+                                      : "A meeting note started during an event takes its title and the people invited.",
+                                  isOn: Binding(get: { model.settings.useCalendar }, set: { model.useCalendar($0) }))
+                    if model.settings.useCalendar, model.calendarGranted {
+                        ForEach(model.calendarAccounts) { account in
+                            RowDivider()
+                            Text(account.title)
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 16)
+                                .padding(.top, 12)
+                                .padding(.bottom, 4)
+                                .accessibilityAddTraits(.isHeader)
+                            ForEach(account.calendars) { calendar in
+                                if calendar.id != account.calendars.first?.id { RowDivider() }
+                                SettingToggle(calendar.title, isOn: includes(calendar))
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("Reads the accounts in the Calendar app on this Mac, including shared and subscribed calendars, and works offline. The event title and invitees go to your notes model with the transcript.")
+                }
+
                 SettingsSection("Permissions") {
                     PermissionStatusRow(title: "Microphone", caption: "Needed to hear your voice.", granted: model.microphoneGranted, action: model.requestMicrophone)
                     RowDivider()
                     PermissionStatusRow(title: "Accessibility", caption: "Needed for automatic paste and modifier-key shortcuts.", granted: model.accessibilityGranted, action: model.requestAccessibility)
+                    RowDivider()
+                    PermissionStatusRow(title: "Calendar", caption: "Optional. Turns on Use Calendar for meeting notes.", granted: model.calendarGranted) { model.useCalendar(true) }
                 } footer: {
                     Label("Built-in models process speech on this Mac. A selected API connection sends audio to its endpoint. Temporary recordings are removed after processing; external providers control their own retention.", systemImage: "lock.shield")
                 }
@@ -139,6 +185,9 @@ struct SettingsView: View {
         .toggleStyle(.switch)
         .animation(.ui, value: model.microphoneGranted)
         .animation(.ui, value: model.accessibilityGranted)
+        .animation(.ui, value: model.calendarGranted)
+        .animation(.ui, value: model.settings.useCalendar)
+        .animation(.ui, value: model.calendarAccounts)
     }
 
     static let spokenLanguages = [
@@ -168,6 +217,24 @@ struct SettingsView: View {
             : "Add the names and terms you say often, then download the phrase booster there so Parakeet listens for them. About 100 MB, runs on this Mac."
     }
 
+    private var pauseMediaWhileDictating: Binding<Bool> {
+        Binding(get: { model.settings.pauseMediaWhileDictating }, set: { isOn in
+            model.settings.pauseMediaWhileDictating = isOn
+            model.saveSettings()
+            if isOn { Task { await AppleEventMediaPlayers.requestPermission() } }
+        })
+    }
+
+    private func includes(_ calendar: CalendarInfo) -> Binding<Bool> {
+        Binding(
+            get: { !model.settings.excludedCalendarIDs.contains(calendar.id) },
+            set: { isOn in
+                if isOn { model.settings.excludedCalendarIDs.remove(calendar.id) } else { model.settings.excludedCalendarIDs.insert(calendar.id) }
+                model.saveSettings()
+            }
+        )
+    }
+
     private func setting<Value>(_ keyPath: WritableKeyPath<AppSettings, Value>) -> Binding<Value> {
         Binding(
             get: { model.settings[keyPath: keyPath] },
@@ -177,19 +244,26 @@ struct SettingsView: View {
 }
 
 private struct ShortcutRecorder: View {
+    enum Kind { case dictation, cancel }
+
     let model: AppModel
+    let kind: Kind
     @State private var monitor: Any?
     @State private var held: ShortcutModifiers = []
     @State private var modifierCandidate: DictationShortcut?
     @State private var feedback: String?
 
     private var isCapturing: Bool { monitor != nil }
-    private var shortcut: DictationShortcut { model.settings.shortcut }
+    private var shortcut: DictationShortcut? {
+        kind == .dictation ? model.settings.shortcut : model.settings.cancelShortcut
+    }
+    private var title: String { kind == .dictation ? "Keyboard shortcut" : "Cancel shortcut" }
+    private var placeholder: String { kind == .dictation ? "" : "Set Shortcut…" }
 
     var body: some View {
-        SettingRow("Keyboard shortcut", caption: caption) {
+        SettingRow(title, caption: caption) {
             HStack(spacing: 6) {
-                if shortcut != .optionSpace, !isCapturing {
+                if kind == .dictation, shortcut != .optionSpace, !isCapturing {
                     Button("Reset to \(DictationShortcut.optionSpace.spokenName)", systemImage: "arrow.counterclockwise") {
                         stop()
                         model.changeShortcut(.optionSpace)
@@ -199,10 +273,18 @@ private struct ShortcutRecorder: View {
                     .foregroundStyle(.secondary)
                     .help("Reset to \(DictationShortcut.optionSpace.displayName)")
                     .transition(.opacity)
+                } else if kind == .cancel, shortcut != nil, !isCapturing {
+                    Button("Clear", systemImage: "xmark.circle") { model.changeCancelShortcut(nil) }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Remove the cancel shortcut")
+                    .transition(.opacity)
                 }
                 recordButton
-                    .accessibilityLabel(isCapturing ? "Keyboard shortcut, waiting for keys" : "Keyboard shortcut, \(shortcut.spokenName)")
-                    .accessibilityHint("Click, then press a shortcut, or press and release a modifier key such as Option.")
+                    .accessibilityLabel(isCapturing ? "\(title), waiting for keys" : "\(title), \(shortcut?.spokenName ?? "not set")")
+                    .accessibilityHint(kind == .dictation ? "Click, then press a shortcut, or press and release a modifier key such as Option."
+                                                          : "Click, then press a shortcut that includes a key, such as Control Option K.")
             }
             .disabled(model.isBusy)
         }
@@ -213,15 +295,23 @@ private struct ShortcutRecorder: View {
     }
 
     private var caption: String? {
-        if isCapturing { return feedback ?? "Press and release ⌃, ⌥, ⇧ or ⌘ alone, use a key combination, or press an F-key. Esc cancels." }
-        return shortcut.isModifierOnly ? "Needs Accessibility. Uses the left or right key you recorded." : "Starts dictation from any app."
+        if isCapturing {
+            return feedback ?? (kind == .dictation ? "Press and release ⌃, ⌥, ⇧, ⌘ or Fn alone, use a key combination, or press an F-key. Esc cancels."
+                                                   : "Hold ⌃, ⌥ or ⌘ and press a key, or press an F-key. Esc leaves it as is.")
+        }
+        switch kind {
+        case .dictation:
+            if shortcut?.keyCode == UInt32(kVK_Function) { return "Needs Accessibility. Set “Press 🌐 key to” to “Do Nothing” in Keyboard settings." }
+            return shortcut?.isModifierOnly == true ? "Needs Accessibility. Uses the left or right key you recorded." : "Starts dictation from any app."
+        case .cancel: return "Also cancels a dictation from any app. Esc always does."
+        }
     }
 
     @ViewBuilder private var recordButton: some View {
         let button = Button {
             if isCapturing { stop() } else { start() }
         } label: {
-            Text(isCapturing ? (held.isEmpty ? "Type shortcut…" : held.symbols + " …") : shortcut.displayName)
+            Text(isCapturing ? (held.isEmpty ? "Type shortcut…" : held.symbols + " …") : (shortcut?.displayName ?? placeholder))
                 .frame(minWidth: 96)
                 .contentTransition(.opacity)
         }
@@ -247,32 +337,38 @@ private struct ShortcutRecorder: View {
         model.registerShortcut()
     }
 
+    private func change(_ shortcut: DictationShortcut) {
+        kind == .dictation ? model.changeShortcut(shortcut) : model.changeCancelShortcut(shortcut)
+    }
+
     private func capture(_ event: NSEvent) {
         let flags = event.modifierFlags
-        let modifiers = ShortcutModifiers(Self.modifierFlags.filter { flags.contains($0.flag) }.map(\.modifier))
-        guard event.type == .keyDown else { return modifiersChanged(to: modifiers, keyCode: Int(event.keyCode)) }
+        var modifiers = ShortcutModifiers(Self.modifierFlags.filter { flags.contains($0.flag) }.map(\.modifier))
+        // Arrow and F-key presses also carry the Fn flag, so only track Fn from its own key transitions.
+        guard event.type == .keyDown else {
+            if flags.contains(.function) { modifiers.insert(.function) }
+            return modifiersChanged(to: modifiers, keyCode: Int(event.keyCode))
+        }
         modifierCandidate = nil
         if Int(event.keyCode) == kVK_Escape, modifiers.isEmpty { return stop() }
         let key = Self.keyNames[Int(event.keyCode)] ?? event.characters(byApplyingModifiers: [])?.uppercased() ?? ""
         guard let shortcut = DictationShortcut(keyCode: UInt32(event.keyCode), modifiers: modifiers, key: key) else {
             let pressed = modifiers.isEmpty ? key : modifiers.symbols + " " + key
             feedback = key.isEmpty ? "That key can’t be a shortcut. Try another."
-                                   : "\(pressed) is for typing, so it can’t start dictation. Hold ⌃, ⌥ or ⌘ with it."
+                                   : "\(pressed) is for typing, so it can’t be a shortcut. Hold ⌃, ⌥ or ⌘ with it."
             return NSSound.beep()
         }
-        model.changeShortcut(shortcut)
+        change(shortcut)
         stop()
     }
 
     private func modifiersChanged(to modifiers: ShortcutModifiers, keyCode: Int) {
         if let candidate = modifierCandidate, candidate.keyCode == UInt32(keyCode), modifiers.isEmpty {
-            model.changeShortcut(candidate)
+            change(candidate)
             return stop()
         }
         modifierCandidate = nil
-        if keyCode == kVK_Function {
-            feedback = "Fn can’t be a shortcut. Try ⌥ alone or an F-key such as F5."
-        } else if held.isEmpty, !modifiers.isEmpty {
+        if held.isEmpty, !modifiers.isEmpty {
             feedback = nil
             if modifiers == DictationShortcut.modifier(for: UInt32(keyCode)), let key = Self.keyNames[keyCode] {
                 modifierCandidate = DictationShortcut(keyCode: UInt32(keyCode), modifiers: [], key: key)
@@ -290,7 +386,7 @@ private struct ShortcutRecorder: View {
     private static let keyNames: [Int: String] = [
         kVK_Control: "Left Control", kVK_RightControl: "Right Control", kVK_Option: "Left Option", kVK_RightOption: "Right Option",
         kVK_Shift: "Left Shift", kVK_RightShift: "Right Shift", kVK_Command: "Left Command", kVK_RightCommand: "Right Command",
-        kVK_Space: "Space", kVK_Return: "Return", kVK_Tab: "Tab", kVK_Delete: "Delete", kVK_ForwardDelete: "Forward Delete",
+        kVK_Function: "Fn", kVK_Space: "Space", kVK_Return: "Return", kVK_Tab: "Tab", kVK_Delete: "Delete", kVK_ForwardDelete: "Forward Delete",
         kVK_Escape: "Esc", kVK_Home: "Home", kVK_End: "End", kVK_PageUp: "Page Up", kVK_PageDown: "Page Down",
         kVK_LeftArrow: "←", kVK_RightArrow: "→", kVK_UpArrow: "↑", kVK_DownArrow: "↓",
         kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4", kVK_F5: "F5", kVK_F6: "F6", kVK_F7: "F7",
